@@ -7,9 +7,29 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer 是并发安全的 bytes.Buffer。Follower.Follow 在独立 goroutine 中
+// 写入，测试主 goroutine 读取，不加锁会被 -race 判定为数据竞争。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func TestRotatingWriterRotates(t *testing.T) {
 	dir := t.TempDir()
@@ -63,7 +83,7 @@ func TestFollower(t *testing.T) {
 	if err := os.WriteFile(path, []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	var buf bytes.Buffer
+	var buf syncBuffer
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
