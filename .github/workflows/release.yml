@@ -1,0 +1,173 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（必须已存在），例如 v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write # 创建 Release 需要写权限
+
+env:
+  CGO_ENABLED: '0' # 纯 Go 依赖，静态交叉编译
+
+jobs:
+  verify:
+    name: 发版前校验
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt 检查
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未通过 gofmt"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: 单元测试
+        run: go test -timeout 300s ./...
+
+      - name: 集成测试
+        run: make test-integration
+
+  build:
+    name: 交叉编译与打包
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 解析并校验版本号
+        id: ver
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          if ! printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::tag 必须形如 v1.2.3，当前为 '$TAG'"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "发布版本：$TAG"
+
+      - name: 交叉编译并打包
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            GOOS="${target%%/*}"
+            GOARCH="${target##*/}"
+            name="gopm2_${VERSION}_${GOOS}_${GOARCH}"
+            stage="dist/${name}"
+            mkdir -p "$stage"
+
+            ext=""
+            if [ "$GOOS" = "windows" ]; then
+              ext=".exe"
+            fi
+            for bin in gopm2 gopm2d; do
+              echo "::group::build ${GOOS}/${GOARCH} ${bin}"
+              GOOS="$GOOS" GOARCH="$GOARCH" \
+                go build -trimpath -ldflags "$LDFLAGS" -o "${stage}/${bin}${ext}" "./cmd/${bin}"
+              echo "::endgroup::"
+            done
+            # 附带文档与示例配置
+            for f in README.md gopm2.toml; do
+              if [ -f "$f" ]; then
+                cp "$f" "$stage/"
+              fi
+            done
+
+            if [ "$GOOS" = "windows" ]; then
+              (cd dist && zip -qr "${name}.zip" "${name}")
+            else
+              tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+            fi
+            rm -rf "$stage"
+          done
+          ls -la dist
+
+      - name: 生成 SHA256 校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.tar.gz ./*.zip > checksums.txt
+          cat checksums.txt
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: 创建 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载构建产物
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖上传附件"
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes
+          fi

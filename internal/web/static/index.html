@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gopm2 面板</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <!-- 登录视图 -->
+  <div id="login-view" class="login-wrap hidden">
+    <form id="login-form" class="login-card">
+      <h1>gopm2</h1>
+      <p class="sub">轻量级进程管理器</p>
+      <input type="password" id="login-password" placeholder="管理员密码" autocomplete="current-password" required>
+      <button type="submit" id="login-btn">登录</button>
+      <p id="login-error" class="error"></p>
+      <p class="hint">初始密码见 daemon 首次启动日志或数据目录下 initial-password 文件</p>
+    </form>
+  </div>
+
+  <!-- 主视图 -->
+  <div id="app-view" class="hidden">
+    <header>
+      <div class="brand">gopm2 <span class="badge-title">面板</span></div>
+      <div class="header-actions">
+        <span id="conn-dot" class="dot" title="连接状态"></span>
+        <button id="btn-save" class="ghost" title="保存快照">save</button>
+        <button id="btn-resurrect" class="ghost" title="从快照恢复">resurrect</button>
+        <button id="btn-logout" class="ghost">退出</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="table-card">
+        <table id="apps-table">
+          <thead>
+            <tr>
+              <th>名称</th><th>状态</th><th>PID</th><th>CPU%</th>
+              <th>内存</th><th>重启</th><th>运行时长</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="apps-tbody"></tbody>
+        </table>
+        <p id="empty-hint" class="hidden center">暂无进程，用 <code>gopm2 start &lt;name&gt; -- &lt;cmd...&gt;</code> 添加</p>
+      </section>
+
+      <!-- 详情抽屉 -->
+      <aside id="detail" class="drawer hidden">
+        <div class="drawer-head">
+          <h2 id="d-name">-</h2>
+          <button id="d-close" class="ghost">✕</button>
+        </div>
+        <div class="drawer-actions">
+          <button id="d-start" class="ok">启动</button>
+          <button id="d-restart" class="warn">重启</button>
+          <button id="d-stop" class="warn">停止</button>
+          <button id="d-delete" class="danger">删除</button>
+        </div>
+        <div id="d-info" class="detail-info"></div>
+        <div class="log-panel">
+          <div class="log-head">
+            <span>日志</span>
+            <div class="log-opts">
+              <label><input type="radio" name="logstream" value="out" checked> stdout</label>
+              <label><input type="radio" name="logstream" value="err"> stderr</label>
+              <label><input type="checkbox" id="d-follow"> 跟随</label>
+              <button id="d-clear" class="ghost small">清屏</button>
+            </div>
+          </div>
+          <pre id="d-logs"></pre>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

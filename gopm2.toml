@@ -1,0 +1,24 @@
+# gopm2 示例配置
+version = 1
+
+[defaults]
+restart_policy = "on-failure"
+max_restarts = 10
+
+[[apps]]
+name = "api"
+command = "node server.js"
+cwd = "./services/api"
+restart_policy = "always"
+health_cmd = "curl -fsS http://127.0.0.1:3000/health"
+health_interval = "15s"
+
+[apps.env]
+NODE_ENV = "production"
+PORT = "3000"
+
+[[apps]]
+name = "worker"
+command = "python worker.py"
+restart_policy = "on-failure"
+max_restarts = 5
