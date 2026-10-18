@@ -1,6 +1,6 @@
 # 编译产物
-/bin/
-/dist/
+bin/
+dist/
 
 # 测试与覆盖率
 *.test

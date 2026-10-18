@@ -3,7 +3,7 @@
 [![CI](https://github.com/gitMFQ/gopm2/actions/workflows/ci.yml/badge.svg)](https://github.com/gitMFQ/gopm2/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/gitMFQ/gopm2?display_name=tag)](https://github.com/gitMFQ/gopm2/releases)
 [![Go](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS%20%7C%20windows-lightgrey)](#安装)
+[![Platform](https://img.shields.io/badge/platform-linux%20amd64%20%7C%20arm64-lightgrey)](#安装)
 
 **gopm2** 是一个用 Go 编写的轻量级进程管理器（类 PM2），面向单机常驻服务：声明式配置、崩溃自动重启、健康检查、日志轮转、指标采集与 Web 面板，全部打包进两个零依赖的静态二进制。
 
@@ -66,7 +66,7 @@ sudo install -m 0755 gopm2 gopm2d /usr/local/bin/
 gopm2 version
 ```
 
-支持的目标平台：`linux/amd64`、`linux/arm64`、`darwin/amd64`、`darwin/arm64`、`windows/amd64`。
+支持的目标平台：`linux/amd64`、`linux/arm64`。**仅支持 Linux**，原因见[已知限制](#已知限制)。
 
 ### 方式二：go install
 
@@ -321,6 +321,7 @@ git push origin v0.1.1
 
 ## 已知限制
 
+- **仅支持 Linux**：进程存活判断与 CPU / 内存采集直接读取 `/proc`，单实例锁使用 `flock`，停止进程依赖 Unix 进程组信号。Windows 无法编译（缺少 `syscall.Flock` / `Setsid` / `Kill` 等）；macOS 虽然能通过编译，但 `/proc` 缺失会导致进程存活判断与指标采集失效，因此不提供非 Linux 产物。
 - `install-cron` / `uninstall-cron` 尚未实现（计划用于 cron 保活）。
 - Web 面板为单管理员口令模型，未提供多用户与权限分级。
 - 面向**单机**进程管理，不涉及集群调度与跨机编排。

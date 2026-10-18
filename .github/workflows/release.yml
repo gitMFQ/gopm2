@@ -89,31 +89,29 @@ jobs:
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           echo "发布版本：$TAG"
 
+      # 仅发布 Linux：运行期依赖 /proc、flock 与进程组信号，
+      # Windows 无法编译，macOS 虽可编译但进程存活判断与指标采集不可用。
       - name: 交叉编译并打包
         env:
-          TAG: ${{ steps.ver.outputs.tag }}
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           LDFLAGS="-s -w -X main.version=${VERSION}"
           mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+          for target in linux/amd64 linux/arm64; do
             GOOS="${target%%/*}"
             GOARCH="${target##*/}"
             name="gopm2_${VERSION}_${GOOS}_${GOARCH}"
             stage="dist/${name}"
             mkdir -p "$stage"
 
-            ext=""
-            if [ "$GOOS" = "windows" ]; then
-              ext=".exe"
-            fi
             for bin in gopm2 gopm2d; do
               echo "::group::build ${GOOS}/${GOARCH} ${bin}"
               GOOS="$GOOS" GOARCH="$GOARCH" \
-                go build -trimpath -ldflags "$LDFLAGS" -o "${stage}/${bin}${ext}" "./cmd/${bin}"
+                go build -trimpath -ldflags "$LDFLAGS" -o "${stage}/${bin}" "./cmd/${bin}"
               echo "::endgroup::"
             done
+
             # 附带文档与示例配置
             for f in README.md gopm2.toml; do
               if [ -f "$f" ]; then
@@ -121,11 +119,7 @@ jobs:
               fi
             done
 
-            if [ "$GOOS" = "windows" ]; then
-              (cd dist && zip -qr "${name}.zip" "${name}")
-            else
-              tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-            fi
+            tar -C dist -czf "dist/${name}.tar.gz" "${name}"
             rm -rf "$stage"
           done
           ls -la dist
@@ -134,7 +128,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum ./*.tar.gz ./*.zip > checksums.txt
+          sha256sum ./*.tar.gz > checksums.txt
           cat checksums.txt
 
       - name: 上传构建产物

@@ -33,21 +33,35 @@ var (
 // TestMain 构造临时数据目录并构建二进制。
 func TestMain(m *testing.M) {
 	// 优先使用 GOPM2_BIN/GOPM2D_BIN 环境变量；否则在 /tmp/gopm2test-bin 编译
-	if os.Getenv("GOPM2_BIN") != "" {
-		gopm2Bin = os.Getenv("GOPM2_BIN")
-	} else {
-		gopm2Bin = filepath.Join(os.TempDir(), "gopm2test-bin", "gopm2")
-	}
-	if os.Getenv("GOPM2D_BIN") != "" {
-		gopm2dBin = os.Getenv("GOPM2D_BIN")
-	} else {
-		gopm2dBin = filepath.Join(os.TempDir(), "gopm2test-bin", "gopm2d")
-	}
-	if _, err := os.Stat(gopm2Bin); err != nil {
+	// 统一取自绝对路径：run() 以 exec 启动二进制，相对路径会随 cwd 解析失败
+	gopm2Bin = absBinPath("GOPM2_BIN", filepath.Join(os.TempDir(), "gopm2test-bin", "gopm2"))
+	gopm2dBin = absBinPath("GOPM2D_BIN", filepath.Join(os.TempDir(), "gopm2test-bin", "gopm2d"))
+	// 任一二进制缺失则自行编译。此时统一落到临时目录，
+	// 避免环境变量给出的相对路径把产物写进源码树（如 test/bin）。
+	if !isRegularFile(gopm2Bin) || !isRegularFile(gopm2dBin) {
+		tmp := filepath.Join(os.TempDir(), "gopm2test-bin")
+		gopm2Bin = filepath.Join(tmp, "gopm2")
+		gopm2dBin = filepath.Join(tmp, "gopm2d")
 		buildBinaries()
 	}
-	_ = gopm2dBin
 	os.Exit(m.Run())
+}
+
+// absBinPath 读取 key 指定的二进制路径并转成绝对路径；未设置时返回 def。
+func absBinPath(key, def string) string {
+	p := os.Getenv(key)
+	if p == "" {
+		p = def
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+func isRegularFile(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.Mode().IsRegular()
 }
 
 func buildBinaries() {
