@@ -108,15 +108,27 @@ func (s *Supervisor) publish(ev types.Event) {
 	s.subMu.Unlock()
 }
 
+// ensureEntry 返回 app 对应的 entry，不存在则新建。
+//
+// 关键：e.app 指针只能在这把锁的保护下替换——supervisor 里每一处读 e.app 的
+// 代码（startLocked / watchExit / setState / startHealthCheck …）都持 e.mu。
+// 早先这里在 s.mu 下直接写 e.app，正好与上面那些读形成数据竞争（CI 的
+// `go test -race` 会抓到）。这里先放掉 s.mu 再取 e.mu，既修正竞争，也避免
+// 形成 "s.mu → e.mu" 的嵌套加锁顺序（Delete/Shutdown 都是先 e.mu 后 s.mu）。
 func (s *Supervisor) ensureEntry(a *types.App) *appEntry {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.apps[a.Spec.Name]; ok {
-		e.app = a
+	e, ok := s.apps[a.Spec.Name]
+	if !ok {
+		e = &appEntry{app: a}
+		s.apps[a.Spec.Name] = e
+		s.mu.Unlock()
 		return e
 	}
-	e := &appEntry{app: a}
-	s.apps[a.Spec.Name] = e
+	s.mu.Unlock()
+
+	e.mu.Lock()
+	e.app = a
+	e.mu.Unlock()
 	return e
 }
 
