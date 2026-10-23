@@ -25,6 +25,7 @@
 
 - **双二进制、零依赖**：`gopm2`（CLI）+ `gopm2d`（常驻守护进程），单文件静态编译，无运行时依赖。
 - **崩溃自动重启**：支持 `always` / `on-failure` / `never` 三种策略，可限制最大重启次数；重启采用指数退避（1s → 2s → 4s … 上限 30s），避免崩溃循环打爆 CPU。
+- **自重启接管**：应用把重启做在自己内部时（例如 dsh 的 dshmarket 插件：先 detach 一个 helper，helper 拉起新进程后再给老进程发信号退出），gopm2 会识别并**接管**那个"替身"进程，而不是再拉起第二个——否则两个实例会抢同一个端口而互相打死。详见[自重启接管](#自重启接管)。
 - **健康检查**：`http` / `tcp` / `exec` 三种探针，连续失败达阈值触发重启。
 - **声明式配置**：TOML 描述全部应用，`gopm2 apply` 幂等收敛（仅重启真正发生变化的进程）。
 - **优雅停止**：先发 `SIGTERM` 给整个进程组，等待 `stop_timeout`（默认 10s）后再 `SIGKILL`，避免残留孤儿进程。
@@ -207,6 +208,8 @@ max_restarts = 5
 | `env` | table | 环境变量 |
 | `restart_policy` | string | `always` / `on-failure` / `never`，默认继承 `defaults` |
 | `max_restarts` | int | 最大重启次数，`0` = 无限 |
+| `stop_timeout` | string | `SIGTERM` 后等多久再 `SIGKILL`，如 `"10s"` |
+| `adopt_window` | string | 自重启接管窗口，如 `"10s"`；留空 = 默认 10s，显式负数（`"-1s"`）= 关闭接管 |
 | `health_cmd` | string | exec 健康检查命令 |
 | `health_http` | string | http 健康检查 URL |
 | `health_tcp` | string | tcp 健康检查地址 `host:port` |
@@ -220,12 +223,47 @@ max_restarts = 5
 | --- | --- |
 | 重启退避 | 1s、2s、4s、8s、16s，上限 30s |
 | 停止宽限 `stop_timeout` | 10s |
+| 自重启接管窗口 `adopt_window` | 10s |
 | 健康检查间隔 / 超时 / 失败阈值 | 10s / 5s / 3 次 |
 | 日志轮转 | 单文件 10MB，保留 5 份 |
 | 指标采样间隔 | 5s |
 | Web 面板监听 | `127.0.0.1:9615` |
 | 数据目录 | `~/.gopm2` |
 | session 有效期 | 24h |
+
+## 自重启接管
+
+有些应用把"重启"做在应用自己内部，而不是交给进程管理器。典型例子是 dsh 的
+**dshmarket 插件**：点重启按钮后，它先 `detach` 一个 helper，helper 等端口释放再
+拉起一个新的 dsh，然后给老进程发 `SIGTERM`；老 dsh 捕获信号后优雅收尾，以**退出码
+0** 退出。
+
+对进程管理器来说这是一次"进程消失"。如果按重启策略再补一个，就会出现两个 dsh
+同时抢 `3080`：一个绑上，另一个 `EADDRINUSE` 崩掉，然后被再次拉起——日志里能看到
+成片的 `EADDRINUSE`，而"真正在服务"的那个反而是管理器视野之外的野进程。
+
+gopm2 的处理是**接管而不是重复拉起**：
+
+1. 受管进程退出后，若这次退出"像交接"（退出码 0，或被 `SIGTERM`/`SIGINT`/
+   `SIGHUP`/`SIGQUIT` 终结）且已存活超过 5s，就先开一个短暂的探测窗口
+   （`adopt_window`，默认 10s）——不是等满，而是一旦发现替身立即接管。
+2. 替身的判定是**命令行签名**：argv 与 Spec 一致（覆盖 `node /usr/bin/dsh --profile
+   web …` 这种"解释器 + 脚本 + 原参数"的形态）、`cwd` 一致、且启动时间不早于被替换
+   的那个进程。候选里取最新的一个。
+3. 接管后该进程照常受守护：存活轮询、CPU/RSS 采样、`stop`/`restart`/`delete`
+   都会按**进程组**给它发信号（接管进程通常是 `setsid` 出来的会话首领，且派生的
+   子进程也在同一组里）。`gopm2 status` 会显示 `"adopted": true` 以便识别。
+4. 接管的进程 stdout/stderr 不在 gopm2 手里，所以会把 `/proc/<pid>/fd/1`、`fd/2`
+   指向的文件（若是常规文件）跟随镜像进 gopm2 自己的日志，`gopm2 logs` 在接管之后
+   依然有输出。
+5. 窗口内没发现替身，就照常按重启策略自己拉起——崩溃恢复不受影响：非零退出码、
+   `SIGSEGV`、`SIGKILL` 都不会开窗口，仍按指数退避立即重启。
+
+关闭接管：给该应用设置 `adopt_window = "-1s"`（TOML）或 `"adopt_window": -1`
+（JSON）。缩短窗口可以降低"外部 `SIGTERM` 且没有替身"时的重启延迟。
+
+> 注意：接管只覆盖"进程还在跑"的情形。如果应用的自重启 helper 失败且没有替身出现，
+> gopm2 仍会按策略拉起一份，这是期望行为。
 
 ## Web 面板
 

@@ -5,28 +5,47 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gitMFQ/gopm2/internal/logutil"
+	"github.com/gitMFQ/gopm2/internal/metrics"
 	"github.com/gitMFQ/gopm2/internal/types"
 )
 
-// managedProcess 封装一个被监督的子进程。
-type managedProcess struct {
-	spec   *types.Spec
-	cmd    *exec.Cmd
-	outLog *logutil.RotatingWriter
-	errLog *logutil.RotatingWriter
+// adoptPollInterval 是接管进程的存活轮询间隔。
+// 非子进程拿不到 SIGCHLD，也没有 Wait 句柄，只能轮询 /proc。
+const adoptPollInterval = 500 * time.Millisecond
 
-	done     chan exitResult // Wait 结束后写一次（由 watchExit 消费）
-	waitDone chan struct{}   // Wait 返回即关闭（供 stop 等待，不与 done 竞争）
+// managedProcess 封装一个被监督的进程。
+//
+// 有两种形态：
+//   - 自己 fork 的（cmd != nil）：有 exec.Cmd 与 Wait 句柄，退出码/信号精确可得；
+//   - 接管的（adopted == true）：进程不是我们 fork 的（应用"自重启"留下的替身），
+//     没有 Wait 句柄，只能轮询 /proc 判断存活，退出原因不可知。
+//
+// 两者对外接口一致：done 送一次退出结果，waitDone 关闭表示进程已不复存在。
+type managedProcess struct {
+	spec *types.Spec
+
+	cmd    *exec.Cmd // 接管的进程为 nil
+	pidVal int
+
+	adopted  bool
+	outLog   *logutil.RotatingWriter // 接管的进程为 nil：日志 fd 不在我们手里
+	errLog   *logutil.RotatingWriter
+	stopOnce sync.Once
+
+	done     chan exitResult // 退出后写一次（由 watchExit 消费）
+	waitDone chan struct{}   // 进程不复存在即关闭（供 stop 等待，不与 done 竞争）
 	stopCh   chan struct{}   // 标记主动停止，避免退出事件触发重启
 }
 
 type exitResult struct {
-	code int
-	err  error
+	code   int
+	signal syscall.Signal // 被信号杀死时的信号；正常退出为 0
+	err    error
 }
 
 // buildCmd 根据 Spec 构造 exec.Cmd：独立进程组 + 日志重定向。
@@ -83,9 +102,11 @@ func spawn(spec *types.Spec, logsDir string) (*managedProcess, error) {
 		errW.Close()
 		return nil, fmt.Errorf("start %q: %w", spec.Name, err)
 	}
+	mp.pidVal = mp.cmd.Process.Pid
 	go func() {
 		err := mp.cmd.Wait()
 		code := 0
+		var sig syscall.Signal
 		if err != nil {
 			if ee, ok := err.(*exec.ExitError); ok {
 				code = ee.ExitCode()
@@ -93,43 +114,107 @@ func spawn(spec *types.Spec, logsDir string) (*managedProcess, error) {
 				code = -1
 			}
 		}
+		if ps := mp.cmd.ProcessState; ps != nil {
+			if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+				sig = ws.Signal()
+			}
+		}
 		// Wait 返回后 stdout/stderr 拷贝 goroutine 已结束，可安全关闭日志 fd（防泄漏）
 		mp.outLog.Close()
 		mp.errLog.Close()
-		mp.done <- exitResult{code: code, err: err}
+		mp.done <- exitResult{code: code, signal: sig, err: err}
 		close(mp.waitDone)
 	}()
 	return mp, nil
 }
 
+// adopt 把一个已经存在、但不是我们 fork 的进程纳入守护。
+// 没有 Wait 句柄，因此用轮询 /proc 的方式感知退出；退出码不可知，记为 -1。
+// startedAt 是它的真实启动时刻，轮询时用它防 pid 复用（pid 被回收后另作他用时
+// 启动时间会对不上，据此判定它已不是原来那个进程）。
+func adopt(spec *types.Spec, pid int, startedAt time.Time) *managedProcess {
+	mp := &managedProcess{
+		spec:     spec,
+		pidVal:   pid,
+		adopted:  true,
+		done:     make(chan exitResult, 1),
+		waitDone: make(chan struct{}),
+		stopCh:   make(chan struct{}),
+	}
+	go func() {
+		ticker := time.NewTicker(adoptPollInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if !metrics.PidAlive(pid) {
+				break
+			}
+			// startedAt 未知（读不到 /proc）时不做身份校验：此时 PidAlive 就是唯一依据，
+			// 拿零值去比会把一个活着的进程误判成已退出。
+			if !startedAt.IsZero() && !sameProcess(pid, startedAt) {
+				break
+			}
+		}
+		mp.done <- exitResult{code: -1}
+		close(mp.waitDone)
+	}()
+	return mp
+}
+
 // pid 返回进程 pid（未启动返回 0）。
 func (mp *managedProcess) pid() int {
+	if mp.pidVal > 0 {
+		return mp.pidVal
+	}
 	if mp.cmd == nil || mp.cmd.Process == nil {
 		return 0
 	}
 	return mp.cmd.Process.Pid
 }
 
-// stop 先向整个进程组发 SIGTERM，超时后 SIGKILL。等待 Wait 完成。
+// markStop 幂等地标记"主动停止"，避免重复 close 造成 panic。
+func (mp *managedProcess) markStop() {
+	mp.stopOnce.Do(func() { close(mp.stopCh) })
+}
+
+// stop 先向整个进程组发 SIGTERM，超时后 SIGKILL。等待进程不复存在。
+//
+// 对接管的进程这一点尤其重要：它是 setsid 出来的独立会话首领（pgid == pid），
+// 只有按进程组发信号才能连带清掉它派生的子进程，否则端口会被野进程继续占着。
 func (mp *managedProcess) stop(timeout time.Duration) {
-	if mp.cmd == nil || mp.cmd.Process == nil {
+	pid := mp.pid()
+	if pid <= 0 {
 		return
 	}
-	pgid, err := syscall.Getpgid(mp.pid())
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	pgid, err := syscall.Getpgid(pid)
 	if err != nil {
-		// 进程可能已退出
+		// 进程可能已退出；接管的进程靠轮询确认，等它自己收尾
+		if mp.adopted {
+			<-mp.waitDone
+		}
 		return
 	}
-	// 负 pid：向整个进程组发信号
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	// 安全兜底：绝不向"我们自己所在的进程组"发整组信号（-1 会打掉 daemon 自己）。
+	// 受管进程都通过 Setpgid 有独立进程组，正常不会走到这里，纯属防御。
+	if pgid == syscall.Getpgrp() {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	} else {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case <-mp.waitDone:
 		return
 	case <-timer.C:
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		<-mp.waitDone // 等 Wait 回收，避免僵尸
+		if pgid == syscall.Getpgrp() {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		} else {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		}
+		<-mp.waitDone // 等回收，避免僵尸/残留
 	}
 }
 

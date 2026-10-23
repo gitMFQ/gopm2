@@ -31,6 +31,8 @@ type AppEntry struct {
 	Env            map[string]string `toml:"env"`
 	RestartPolicy  string            `toml:"restart_policy"`
 	MaxRestarts    *int              `toml:"max_restarts"`
+	StopTimeout    string            `toml:"stop_timeout"`    // 例如 "10s"
+	AdoptWindow    string            `toml:"adopt_window"`    // 自重启接管窗口，如 "10s"；留空用默认，显式负数关闭接管
 	HealthCmd      string            `toml:"health_cmd"`      // exec 检查
 	HealthHTTP     string            `toml:"health_http"`     // http 检查
 	HealthTCP      string            `toml:"health_tcp"`      // tcp 检查
@@ -70,6 +72,21 @@ func LoadFile(path string) ([]*types.Spec, error) {
 		}
 		if a.MaxRestarts != nil {
 			spec.MaxRestarts = *a.MaxRestarts
+		}
+		if a.StopTimeout != "" {
+			d, err := time.ParseDuration(a.StopTimeout)
+			if err != nil {
+				return nil, fmt.Errorf("app %q: invalid stop_timeout: %w", a.Name, err)
+			}
+			spec.StopTimeout = types.Duration(d)
+		}
+		// AdoptWindow：留空 = 用默认窗口；显式负数（如 "-1s"）表示关闭接管。
+		if a.AdoptWindow != "" {
+			d, err := time.ParseDuration(a.AdoptWindow)
+			if err != nil {
+				return nil, fmt.Errorf("app %q: invalid adopt_window: %w", a.Name, err)
+			}
+			spec.AdoptWindow = types.Duration(d)
 		}
 		// 健康检查：三选一
 		var interval time.Duration

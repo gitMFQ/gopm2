@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/gitMFQ/gopm2/internal/types"
 )
@@ -71,5 +72,50 @@ func TestLoadFileInvalid(t *testing.T) {
 	os.WriteFile(path, []byte("[[apps]]\nname = \"x\"\n"), 0o644) // 缺 command
 	if _, err := LoadFile(path); err == nil {
 		t.Fatal("expected error for missing command")
+	}
+}
+
+// TestLoadFileAdoptWindow 验证自重启接管窗口的 TOML 键：留空 = 默认窗口，
+// 显式数值原样生效，显式负数 = 关闭接管。
+func TestLoadFileAdoptWindow(t *testing.T) {
+	dir := t.TempDir()
+	content := `
+version = 1
+
+[[apps]]
+name = "default_window"
+command = "sleep 1"
+
+[[apps]]
+name = "custom_window"
+command = "sleep 1"
+adopt_window = "3s"
+
+[[apps]]
+name = "disabled"
+command = "sleep 1"
+adopt_window = "-1s"
+`
+	path := filepath.Join(dir, "gopm2.toml")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	specs, err := LoadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]*types.Spec{}
+	for _, s := range specs {
+		byName[s.Name] = s
+	}
+
+	if got := byName["default_window"].AdoptWindow.Std(); got != types.DefaultAdoptWindow {
+		t.Fatalf("omitted adopt_window should default to %v, got %v", types.DefaultAdoptWindow, got)
+	}
+	if got := byName["custom_window"].AdoptWindow.Std(); got != 3*time.Second {
+		t.Fatalf("explicit adopt_window not honored, got %v", got)
+	}
+	if got := byName["disabled"].AdoptWindow.Std(); got >= 0 {
+		t.Fatalf("negative adopt_window should disable adoption, got %v", got)
 	}
 }

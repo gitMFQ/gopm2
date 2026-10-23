@@ -39,7 +39,17 @@ type Supervisor struct {
 	// 指标采样器：按 app 名保存，pid 变化时重建（避免按 pid 泄漏）
 	samplersMu sync.Mutex
 	samplers   map[string]*pidSampler
+
+	// procScan 是进程扫描函数，默认 scanProcs；测试可注入。
+	procScan procScanFunc
+
+	// adoptMinUptime 是"值得等替身"的最短存活时间，默认 defaultAdoptMinUptime；
+	// 测试可调小。
+	adoptMinUptime time.Duration
 }
+
+// defaultAdoptMinUptime 见 watchExit 里的说明。
+const defaultAdoptMinUptime = 5 * time.Second
 
 // pidSampler 绑定 pid 与采样器，pid 变化（重启）时重建以重置 CPU 基准。
 type pidSampler struct {
@@ -57,11 +67,13 @@ type appEntry struct {
 // New 创建 Supervisor。
 func New(logsDir string, store Store) *Supervisor {
 	return &Supervisor{
-		logsDir:  logsDir,
-		store:    store,
-		apps:     make(map[string]*appEntry),
-		subs:     make(map[chan types.Event]struct{}),
-		samplers: make(map[string]*pidSampler),
+		logsDir:        logsDir,
+		store:          store,
+		apps:           make(map[string]*appEntry),
+		subs:           make(map[chan types.Event]struct{}),
+		samplers:       make(map[string]*pidSampler),
+		procScan:       scanProcs,
+		adoptMinUptime: defaultAdoptMinUptime,
 	}
 }
 
@@ -175,6 +187,7 @@ func (s *Supervisor) startLocked(e *appEntry) error {
 	e.app.Status.StartedAt = time.Now()
 	e.app.Status.ExitCode = 0
 	e.app.Status.DesiredOn = true
+	e.app.Status.Adopted = false
 	e.app.Status.LastError = ""
 	s.setState(e, types.StateOnline)
 
@@ -185,19 +198,21 @@ func (s *Supervisor) startLocked(e *appEntry) error {
 	return nil
 }
 
-// watchExit 等待进程退出并决策是否重启。
+// watchExit 等待进程退出并决策：先看应用是否自己换了个替身（接管），
+// 再按重启策略决定是否自己补一个。
 func (s *Supervisor) watchExit(e *appEntry, proc *managedProcess) {
 	res := <-proc.done
 
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	// 若已经被新进程替换（restart 场景），忽略旧退出事件
 	if e.proc != proc {
+		e.mu.Unlock()
 		return
 	}
 	e.proc = nil
 	e.app.Status.PID = 0
+	e.app.Status.Adopted = false
 	e.app.Status.ExitCode = res.code
 	e.app.Status.StoppedAt = time.Now()
 	s.stopHealthCheck(e)
@@ -205,13 +220,20 @@ func (s *Supervisor) watchExit(e *appEntry, proc *managedProcess) {
 	// 主动停止：watchExit 由 stopLocked 处理状态，此处只在非停止路径执行
 	select {
 	case <-proc.stopCh:
-		// stopLocked 已处理
+		e.mu.Unlock()
 		return
 	default:
 	}
 
+	// 快照决策所需字段；后续在无锁 goroutine 里用（再读 e.app 会与并发 Register 竞争）
+	spec := e.app.Spec
+	wasAdopted := proc.adopted
+	prevStart := e.app.Status.StartedAt
+	uptime := time.Since(e.app.Status.StartedAt)
+	desired := e.app.Status.DesiredOn
+	restarts := e.app.Status.Restarts
+
 	// 异常退出，按策略重启
-	spec := &e.app.Spec
 	shouldRestart := false
 	switch spec.Restart {
 	case types.RestartAlways:
@@ -221,14 +243,26 @@ func (s *Supervisor) watchExit(e *appEntry, proc *managedProcess) {
 	case types.RestartNever:
 		shouldRestart = false
 	}
-	if !e.app.Status.DesiredOn {
+	if !desired {
 		shouldRestart = false
 	}
 	// max_restarts 限制
-	if shouldRestart && spec.MaxRestarts > 0 && e.app.Status.Restarts >= spec.MaxRestarts {
+	if shouldRestart && spec.MaxRestarts > 0 && restarts >= spec.MaxRestarts {
 		shouldRestart = false
 		e.app.Status.LastError = fmt.Sprintf("reached max_restarts=%d", spec.MaxRestarts)
 	}
+
+	window := spec.AdoptWindow.Std()
+	if window == 0 {
+		// 兼容升级前写入的旧 Spec（adopt_window 未归一化，读出来是零值）。
+		// 这里补默认值，避免老库里的应用静默失去接管能力。
+		window = types.DefaultAdoptWindow
+	}
+	// 是否值得等一个"替身"：应用自重启几乎都表现为"优雅退出（码 0）"或
+	// "被终止信号结束"（dsh 捕获 SIGTERM 后以码 0 退出，所以码 0 是主信号）。
+	// 再叠一条"活得够久"的门槛：短命令（echo hi / 秒级批处理循环）退出后不应
+	// 白等一个窗口——那种形态几乎不可能带替身，而快速重启对它是刚需。
+	plausible := window >= 0 && (wasAdopted || (handoffPlausible(res) && uptime >= s.adoptMinUptime))
 
 	if !shouldRestart {
 		if res.code == 0 {
@@ -236,27 +270,40 @@ func (s *Supervisor) watchExit(e *appEntry, proc *managedProcess) {
 		} else {
 			s.setState(e, types.StateErrored)
 		}
+		e.mu.Unlock()
+
+		// 不重启不等于"它真的停了"：自重启的应用可能已经留下替身在跑。
+		// 这里只做一次即时扫描（不等待），命中则继续守护它，避免状态谎报。
+		if plausible && window > 0 {
+			s.adoptReplacement(e, proc, spec, prevStart, 0)
+		}
 		return
 	}
 
 	// 计算退避
-	restarts := e.app.Status.Restarts
-	// 存活时间足够长，重置计数
-	if time.Since(e.app.Status.StartedAt) > uptimeResetThreshold {
-		restarts = 0
+	if uptime > uptimeResetThreshold {
+		restarts = 0 // 存活时间足够长，重置计数
 	}
 	backoff := backoffFor(restarts)
 	s.setState(e, types.StateRestarting)
+	e.mu.Unlock()
 
 	// 释放锁后睡眠再重启，避免阻塞其他操作
 	go func() {
+		// 接管窗口：先看应用是不是自己把替身拉起来了（dshmarket 自重启 dsh
+		// 就是这样）。命中即接管，绝不再 spawn 第二个，否则两个进程抢同一端口。
+		if plausible {
+			if s.adoptReplacement(e, proc, spec, prevStart, window) {
+				return
+			}
+		}
 		timer := time.NewTimer(backoff)
 		defer timer.Stop()
 		// 等待期间可能被 stop/delete 取消
 		e.mu.Lock()
-		desired := e.app.Status.DesiredOn && e.proc == nil
+		wanted := e.app.Status.DesiredOn && e.proc == nil
 		e.mu.Unlock()
-		if !desired {
+		if !wanted {
 			return
 		}
 		<-timer.C
@@ -271,6 +318,163 @@ func (s *Supervisor) watchExit(e *appEntry, proc *managedProcess) {
 			return
 		}
 	}()
+}
+
+// handoffPlausible 判断这次退出是否像"应用自己的重启交接"。
+//
+// 判据不是"被信号杀死"：dsh 这类应用会捕获 SIGTERM，优雅收尾后以退出码 0 退出，
+// 从 WaitStatus 里看不到信号。所以码 0 与"被礼貌信号终结"都算可疑形态。
+func handoffPlausible(res exitResult) bool {
+	if res.code == 0 {
+		return true
+	}
+	return politelyTerminated(res.signal)
+}
+
+// adoptReplacement 查找应用自己拉起的替身进程并接管。
+//
+// 返回 true 表示已经接管（调用方不要再 spawn）；false 表示没找到，调用方可以
+// 安全地自己重启。window 的语义：
+//   - < 0：接管被禁用，直接返回 false；
+//   - == 0：只做一次即时扫描（供"不该重启但可能已被替身接管"的路径用）；
+//   - > 0：即时扫描后继续轮询，直到命中或窗口用尽。
+//
+// 命中即返回，所以真实延迟通常只有替身出现所需的那点时间（dsh 场景约 1s），
+// 窗口只是最长等待。
+func (s *Supervisor) adoptReplacement(e *appEntry, dead *managedProcess, spec types.Spec, prevStart time.Time, window time.Duration) bool {
+	if window < 0 {
+		return false
+	}
+	// 主动 stop/restart 由 stopLocked 负责，stopCh 已关闭，不在此路径
+	select {
+	case <-dead.stopCh:
+		return false
+	default:
+	}
+
+	// 基准：替身必须比"被替换的那个进程"更新。用它自己的启动时刻而不是退出
+	// 时刻，这样"s先起新的再杀老的"与"先杀老的再起新的"两种交接都覆盖。
+	since := procStartOf(prevStart, dead)
+	deadline := time.Now().Add(window)
+	scan := s.procScan
+	if scan == nil {
+		scan = scanProcs
+	}
+	for {
+		// 每轮重算排除集：窗口期间别的 app 可能新起了进程，不能把它的进程抢来
+		if pid, ok := findReplacement(&spec, since, scan, s.excludeSet()); ok {
+			return s.adoptPID(e, spec, pid)
+		}
+		if !sleepUntil(deadline, adoptPollInterval) {
+			return false
+		}
+	}
+}
+
+// adoptPID 在持锁状态下把一个替身进程纳入守护，成功返回 true。
+func (s *Supervisor) adoptPID(e *appEntry, spec types.Spec, pid int) bool {
+	startAt := procStartAt(pid)
+	statusStart := startAt
+	if statusStart.IsZero() {
+		statusStart = time.Now()
+	}
+
+	e.mu.Lock()
+	// 窗口期间意图可能已变（stop/delete）或已有新进程接位
+	if e.proc != nil || !e.app.Status.DesiredOn {
+		e.mu.Unlock()
+		return true
+	}
+	proc := adopt(&spec, pid, startAt)
+	e.proc = proc
+	e.app.Status.PID = pid
+	e.app.Status.Adopted = true
+	e.app.Status.StartedAt = statusStart
+	e.app.Status.ExitCode = 0
+	e.app.Status.LastError = ""
+	s.setState(e, types.StateOnline)
+	s.startHealthCheck(e)
+	e.mu.Unlock()
+
+	// 接管进程的 stdout/stderr 不在我们手里，尽力跟随镜像进日志，
+	// 让 `gopm2 logs` 在接管之后依然能看到输出。进程退出后停止镜像。
+	mirrorStop := s.startAdoptedLogMirror(spec.Name, pid)
+	go func() {
+		<-proc.waitDone
+		mirrorStop()
+	}()
+
+	go s.watchExit(e, proc)
+	return true
+}
+
+// excludeSet 返回当前不得接管的 pid 集合：自身、父进程，以及本 daemon 正在
+// 守护的所有进程（含接管来的）。否则两个命令行相同的 app 会互相抢进程。
+func (s *Supervisor) excludeSet() excludeSet {
+	set := buildExcludeSet()
+	s.mu.Lock()
+	entries := make([]*appEntry, 0, len(s.apps))
+	for _, e := range s.apps {
+		entries = append(entries, e)
+	}
+	s.mu.Unlock()
+	for _, e := range entries {
+		e.mu.Lock()
+		if e.proc != nil {
+			set.add(e.proc.pid())
+		}
+		e.mu.Unlock()
+	}
+	return set
+}
+
+// procStartOf 返回受管进程的启动时刻，用作"替身必须比它更新"的基准。
+//
+// 进程可能已经死了，读不到 /proc；因此优先用 watchExit 在退出瞬间快照下来的
+// StartedAt（由调用方传入）。两者都不可用时返回零值，表示不做时间过滤。
+func procStartOf(recorded time.Time, proc *managedProcess) time.Time {
+	if !recorded.IsZero() {
+		return recorded
+	}
+	if proc.adopted {
+		// 接管的进程：pid 可能已被回收，读到的未必是原来那个
+		return time.Time{}
+	}
+	if t, err := metrics.ProcessStartTime(proc.pid()); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
+// politelyTerminated 判断退出是否属于"被终止信号结束"（而非崩溃）。
+func politelyTerminated(sig syscall.Signal) bool {
+	switch sig {
+	case syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT:
+		return true
+	default:
+		return false
+	}
+}
+
+// procStartAt 读取进程真实启动时间；读不到时返回零值（调用方对零值不做身份校验）。
+func procStartAt(pid int) time.Time {
+	if t, err := metrics.ProcessStartTime(pid); err == nil {
+		return t
+	}
+	return time.Time{}
+}
+
+// sleepUntil 睡一个步长；超过 deadline 时返回 false 表示窗口用尽。
+func sleepUntil(deadline time.Time, step time.Duration) bool {
+	remain := time.Until(deadline)
+	if remain <= 0 {
+		return false
+	}
+	if remain < step {
+		step = remain
+	}
+	time.Sleep(step)
+	return true
 }
 
 // Stop 停止进程，等待退出。
@@ -297,10 +501,11 @@ func (s *Supervisor) stopLocked(e *appEntry) error {
 	}
 	s.setState(e, types.StateStopping)
 	proc := e.proc
-	close(proc.stopCh) // 标记主动停止
+	proc.markStop() // 标记主动停止（幂等，避免重复 close panic）
 	proc.stop(e.app.Spec.StopTimeout.Std())
 	e.proc = nil
 	e.app.Status.PID = 0
+	e.app.Status.Adopted = false
 	e.app.Status.StoppedAt = time.Now()
 	s.setState(e, types.StateStopped)
 	return nil

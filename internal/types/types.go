@@ -29,6 +29,20 @@ const (
 	RestartNever     RestartPolicy = "never"
 )
 
+// DefaultAdoptWindow 是进程退出后等待"应用自己换了替身"的默认窗口。
+//
+// 背景：有些应用把重启做在应用内部（例如 dsh 的 dshmarket 插件收到重启请求后，
+// 先 detach 一个 helper，helper 等端口释放再拉起新的 dsh，然后给老进程发
+// SIGTERM）。这类"自重启"发生在进程管理器视野之外——如果 gopm2 也按重启策略
+// 补一个，就会双开并互相抢端口。窗口期内扫到同签名的存活替身即接管，不再自己
+// spawn。
+//
+// 10s 的依据：实际时序是"老进程退出 → helper 探到端口空闲（每 250ms 一次）→
+// 再等 300ms → spawn 新进程"，替身通常 1s 内就出现在 /proc 里（注意只需它
+// 存在，不需要它已经 bind 端口）。10s 给了十倍余量；窗口只在"可能有替身"的
+// 退出形态下开启，且一旦扫到就立即接管，所以真实延迟远小于窗口上限。
+const DefaultAdoptWindow = 10 * time.Second
+
 // ParseRestartPolicy 校验并解析重启策略字符串。
 func ParseRestartPolicy(s string) (RestartPolicy, error) {
 	switch RestartPolicy(s) {
@@ -105,6 +119,7 @@ type Spec struct {
 	Restart     RestartPolicy     `json:"restart" toml:"restart_policy"`
 	MaxRestarts int               `json:"max_restarts" toml:"max_restarts"` // 0 = 无限
 	StopTimeout Duration          `json:"stop_timeout" toml:"-"`            // SIGTERM 后等待多久再 SIGKILL，默认 10s
+	AdoptWindow Duration          `json:"adopt_window" toml:"adopt_window"` // 自重启接管窗口，默认 10s；留 0 用默认，显式负数表示关闭接管
 	Health      HealthSpec        `json:"health,omitempty" toml:"-"`
 }
 
@@ -124,6 +139,10 @@ func (s *Spec) Normalize() error {
 	}
 	if s.StopTimeout <= 0 {
 		s.StopTimeout = Duration(10 * time.Second)
+	}
+	if s.AdoptWindow == 0 {
+		// 零值 = 用户没填 → 默认窗口；显式负数表示关闭接管，原样保留。
+		s.AdoptWindow = Duration(DefaultAdoptWindow)
 	}
 	if s.Health.Type != HealthNone {
 		if s.Health.Target == "" {
@@ -154,6 +173,10 @@ type Status struct {
 	LastError  string    `json:"last_error,omitempty"`
 	CPUPercent float64   `json:"cpu_percent"` // 最近一次采样
 	RSSBytes   int64     `json:"rss_bytes"`   // 最近一次采样
+	// Adopted 为真表示当前 PID 不是本 daemon fork 出来的，而是应用"自重启"后
+	// 留下的替身进程（例如 dshmarket 自重启 dsh）。它仍在守护之下：存活监控、
+	// 指标采样、stop/delete 都照常生效，只是没有 Wait 句柄，退出码靠轮询发现。
+	Adopted bool `json:"adopted,omitempty"`
 }
 
 // App 是 Spec + Status 的聚合，API 返回值。
